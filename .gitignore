@@ -1,0 +1,15 @@
+.venv/
+.cache/
+runs/
+.env
+__pycache__/
+*.pyc
+
+# Machine-specific resources and large assets
+resources.json
+data/
+models/
+*.log
+*.tmp
+.env.*
+!.env.example

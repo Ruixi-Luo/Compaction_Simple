@@ -1,0 +1,1 @@
+Standalone source snapshot of the five-condition single-call implementation. No runtime import from the historical repository. Dataset conversion, prompts, InfoGap formulas, and length-safe upstream adapters preserved.

@@ -1,0 +1,45 @@
+{
+  "run_name": "once100_20261025",
+  "datasets": [
+    "hotpotqa",
+    "qasper"
+  ],
+  "sample_size": 100,
+  "sample_seed": 20261025,
+  "retained_ratio": 0.5,
+  "methods": [
+    "full",
+    "no_context",
+    "selective_context",
+    "llmlingua2",
+    "llm_summary"
+  ],
+  "summary_policy": "original_first_draft",
+  "device": "cuda",
+  "bootstrap_repetitions": 500,
+  "bootstrap_seed": 20261025,
+  "cost_reserve_cny": 20,
+  "reader": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "model": "Qwen/Qwen3-30B-A3B-Instruct-2507",
+    "temperature": 0.0,
+    "enable_thinking": false,
+    "stream": false,
+    "max_api_attempts": 2000,
+    "timeout_seconds": 90,
+    "min_interval_seconds": 2.0,
+    "max_tokens": 128
+  },
+  "summary": {
+    "base_url": "https://api.siliconflow.cn/v1",
+    "api_key_env": "SILICONFLOW_API_KEY",
+    "model": "deepseek-ai/DeepSeek-V3.2",
+    "temperature": 0.0,
+    "enable_thinking": false,
+    "stream": true,
+    "max_api_attempts": 700,
+    "timeout_seconds": 1800,
+    "min_interval_seconds": 2.0
+  }
+}
