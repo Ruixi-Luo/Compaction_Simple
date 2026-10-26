@@ -45,10 +45,12 @@ def main():
     root = Path(__file__).resolve().parents[1]
     status = {'now': datetime.now().astimezone().isoformat(), 'runs': {}}
     queue = root / '.cache/qwen_summary_queue_state.json'
-    if queue.exists():
+    if queue.exists() and (root/'runs/once100_qwen_summary_20261025').exists():
         status['queue'] = read_shared_json(queue)
-    for name in ('once100_20261025', 'once100_20261025_iofix', 'once100_qwen_summary_20261025'):
-        run = root / 'runs' / name
+    for run in sorted((root/'runs').iterdir()):
+        if not run.is_dir():
+            continue
+        name = run.name
         if not run.exists():
             continue
         entry = {'report_exists': (run / 'Report.html').exists(), 'datasets': {}, 'api': {}}
@@ -81,6 +83,8 @@ def main():
         completion = run / 'completion.json'
         if completion.exists():
             entry['completion'] = read_shared_json(completion)
+        if (run/'telemetry.json').exists():
+            entry['telemetry'] = read_shared_json(run/'telemetry.json')
         status['runs'][name] = entry
     print(json.dumps(status, ensure_ascii=False, indent=2))
 

@@ -64,6 +64,67 @@ def forecast_scores(probabilities, labels):
     }
 
 
+def calibration_summary(probabilities, labels, bins=5):
+    """Fixed equal-width bins; empirical frequencies, not known true posteriors."""
+    _validate(probabilities, labels)
+    buckets = [[] for _ in range(bins)]
+    for p, y in zip(probabilities, labels):
+        buckets[min(int(p*bins), bins-1)].append((p, y))
+    points, ece = [], 0.0
+    for i, bucket in enumerate(buckets):
+        n = len(bucket)
+        mean = sum(p for p, y in bucket)/n if n else None
+        frequency = sum(y for p, y in bucket)/n if n else None
+        if n:
+            ece += n/len(labels)*abs(mean-frequency)
+        points.append({'low': i/bins, 'high': (i+1)/bins, 'n': n,
+                       'mean_probability': mean, 'yes_frequency': frequency})
+    return {'bins': points, 'ece': ece, 'bin_count': bins,
+            'exact_counts': {str(p): probabilities.count(p) for p in sorted(set(probabilities))}}
+
+
+def score_intervals(probabilities, labels, groups, repetitions, seed, bins=5):
+    """Paired context-cluster bootstrap: identical sampled indices across methods."""
+    members = defaultdict(list)
+    for i, group in enumerate(groups):
+        members[group].append(i)
+    rng, keys = random.Random(seed), list(members)
+    metrics = ('accuracy', 'brier', 'log_loss', 'ece')
+    draws = {m: {k: [] for k in metrics} for m in probabilities}
+    deltas = {m: {k: [] for k in metrics} for m in probabilities}
+    for _ in range(repetitions):
+        indices = [i for group in rng.choices(keys, k=len(keys)) for i in members[group]]
+        y = [labels[i] for i in indices]
+        scores = {}
+        for method, p in probabilities.items():
+            sampled = [p[i] for i in indices]
+            scores[method] = {**forecast_scores(sampled, y),
+                              'ece': calibration_summary(sampled, y, bins)['ece']}
+        for method in probabilities:
+            for metric in metrics:
+                draws[method][metric].append(scores[method][metric])
+                deltas[method][metric].append(scores[method][metric]-scores['full'][metric])
+
+    def interval(values):
+        values = sorted(values)
+        return [values[int(.025*(len(values)-1))], values[int(.975*(len(values)-1))]]
+
+    return {m: {'absolute': {k: interval(v) for k, v in draws[m].items()},
+                'delta_vs_full': {k: interval(v) for k, v in deltas[m].items()}}
+            for m in probabilities}
+
+
+def comparability_curve(matrix, methods):
+    """Descriptive tolerance sweep over unordered pairs, not a significance test."""
+    pairs = [(matrix[a][b]['value'], matrix[b][a]['value'])
+             for i, a in enumerate(methods) for b in methods[i+1:]]
+    thresholds = sorted({0., *(v for pair in pairs for v in pair)})
+    return [{'tolerance': s, 'pairs': len(pairs),
+             'comparable': sum(min(a, b) <= s for a, b in pairs)/len(pairs),
+             'strictly_comparable': sum(min(a, b) <= s < max(a, b) for a, b in pairs)/len(pairs)}
+            for s in thresholds]
+
+
 def payoff_curve(a, b, labels):
     """两动作决策的收益差曲线；保留断点左极限和断点值，不平滑跳跃。"""
     _validate(a, labels)
@@ -150,6 +211,13 @@ def analyze(rows, config):
     ) for method in methods if method != "full"}
     curves = {m: payoff_curve(probabilities['full'], probabilities[m], labels)
               for m in methods if m != 'full'}
+    bins = config.get('reliability_bins', 5)
+    calibration = {m: calibration_summary(probabilities[m], labels, bins) for m in methods}
+    intervals = score_intervals(probabilities, labels, groups,
+                               config['bootstrap_repetitions'], config['bootstrap_seed'], bins)
+    for m in methods:
+        scores[m]['ece'] = calibration[m]['ece']
+        scores[m]['ece_delta_vs_full'] = calibration[m]['ece']-calibration['full']['ece']
     subsets = {}
     for task in sorted({r['source_task'] for r in rows if 'source_task' in r}):
         indices = [i for i, r in enumerate(rows) if r.get('source_task') == task]
@@ -161,6 +229,8 @@ def analyze(rows, config):
                                                 'method_over_full': infogap(p[m], p['full'], y)}
                                              for m in methods if m != 'full'}}
     return {"n": len(rows), "positive_labels": sum(labels), "scores": scores,
+            'calibration': calibration, 'score_intervals': intervals,
+            'comparability': comparability_curve(matrix, methods),
             "context_clusters": len(set(groups)), "payoff_curves_vs_full": curves, "source_tasks": subsets,
             "infogap": matrix, "bootstrap_vs_full": uncertainty,
             "normalization": "2 * sup_t mean[(t-y)(1[p_A<=t]-1[p_B<=t])]; also save unscaled.",

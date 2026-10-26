@@ -28,6 +28,7 @@ class ReplacementTests(unittest.TestCase):
         self.source = self.base / 'old'
         self.destination = self.base / 'new'
         self.config = read_json(ROOT / 'config.json')
+        self.config['summary']['model'] = 'deepseek-ai/DeepSeek-V3.2'  # Historical replacement fixture
         self.config.update(datasets=['hotpotqa'], sample_size=2, bootstrap_repetitions=4)
         self.examples = [dict(id=str(i), context='one two three four five six',
                               question=f'PRIVATE_QUERY_{i}', label=i, context_group='shared')

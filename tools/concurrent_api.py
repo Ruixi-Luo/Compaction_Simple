@@ -48,12 +48,13 @@ class TwoWorkerClient:
         self.key_lock = threading.Lock()
         if allow_api:
             reader.load_keys()
-        for index in range(2):
+        workers = config.get('api_workers', 2)
+        for index in range(workers):
             folder = run / 'api' / role / f'worker_{index + 1}'
             self.offline.append(reader.CachedChatClient(self.config, folder, offline=True))
             worker_config = copy.deepcopy(self.config)
             # Split the existing aggregate attempt cap; never double it.
-            worker_config['max_api_attempts'] = self.config['max_api_attempts'] // 2
+            worker_config['max_api_attempts'] = self.config['max_api_attempts'] // workers + int(index < self.config['max_api_attempts'] % workers)
             self.available.put(reader.CachedChatClient(worker_config, folder, offline=not allow_api))
 
     def complete(self, messages, max_tokens, json_mode=False):
@@ -81,7 +82,7 @@ class TwoWorkerClient:
                 self.available.put(worker)
 
 
-def bounded_results(function, items):
+def bounded_results(function, items, workers=2):
     """At most two tasks in flight; stop scheduling on error and save finished peers.
 
 Yields (input, result) in completion order. Callers write files in this main
@@ -90,9 +91,13 @@ thread and restore sample order before computing metrics.
     from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
     iterator = iter(items)
     failure = None
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    if workers == 1:
+        for item in iterator:
+            yield item, function(item)
+        return
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         pending = {}
-        for _ in range(2):
+        for _ in range(workers):
             item = next(iterator, None)
             if item is not None:
                 pending[pool.submit(function, item)] = item
@@ -109,7 +114,7 @@ thread and restore sample order before computing metrics.
             for item, result in success:
                 yield item, result
             if failure is None:
-                while len(pending) < 2:
+                while len(pending) < workers:
                     item = next(iterator, None)
                     if item is None:
                         break

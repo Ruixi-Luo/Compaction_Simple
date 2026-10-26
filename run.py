@@ -10,6 +10,8 @@ from reader import make_client, predict_one
 from metrics import analyze
 from compressors import LOCAL_METHODS, compress_one
 from report import build_report
+from tools.concurrent_api import TwoWorkerClient, bounded_results, network_pacing
+from telemetry import Progress
 
 METHODS = ['full', 'no_context', 'selective_context', 'llmlingua2', 'llm_summary']
 
@@ -19,7 +21,7 @@ def prepare(config, run, offline=False):
     if offline and not (DATA_ROOT/'tokenizer/qwen3-30b-a3b-instruct-2507.json').exists():
         raise RuntimeError('Offline tokenizer missing.')
     tokenizer = ContextTokenizer()
-    files = [*sorted(ROOT.glob('*.py')), *sorted((ROOT/'compressors').glob('*.py')), ROOT/'models.lock.json', ROOT/'resources.json']
+    files = [*sorted(ROOT.glob('*.py')), *sorted((ROOT/'compressors').glob('*.py')), ROOT/'models.lock.json', ROOT/'resources.json', ROOT/'tools/concurrent_api.py', ROOT/'tools/monitor_progress.py']
     identity = {'protocol': 'single_call_0.5_v1', 'config': config,
                 'code': {str(p.relative_to(ROOT)): file_hash(p) for p in files}}
     manifest_path = run/'manifest.json'
@@ -31,6 +33,7 @@ def prepare(config, run, offline=False):
             if fingerprint(read_json(run/name/'examples.json')) != digest:
                 raise ValueError('Saved samples changed.')
         return tokenizer
+    write_json(run/'config.json', config)
     samples = {}
     for name in config['datasets']:
         examples, source = load_examples(name, config['sample_size'], config['sample_seed'], offline)
@@ -57,8 +60,15 @@ def cached_compression(folder, context, method, ratio, result=None):
     return saved['result']
 
 
-def compress(config, run, tokenizer, offline=False, allow_api=False):
-    """按方法遍历唯一正文；本地模型依次加载，摘要沿用原 prompt。"""
+def api_client(config, role, run, tokenizer, allow_api):
+    """Use independent worker ledgers and one shared spending guard within each stage."""
+    if config.get('api_workers', 1) == 1:
+        return make_client(config, role, run, tokenizer, allow_api)
+    return TwoWorkerClient(config, role, run, tokenizer, allow_api)
+
+
+def compress(config, run, tokenizer, offline=False, allow_api=False, progress=None):
+    """Local models run sequentially; summary requests overlap without seeing the query."""
     ratio = config['retained_ratio']
     for method in config['methods']:
         if method in ('full', 'no_context'):
@@ -66,58 +76,85 @@ def compress(config, run, tokenizer, offline=False, allow_api=False):
         engine = client = None
         for name in config['datasets']:
             folder = run/name
-            contexts = dict.fromkeys(e['context'] for e in read_json(folder/'examples.json'))
-            for i, context in enumerate(contexts, 1):
-                if cached_compression(folder, context, method, ratio) is not None:
-                    continue
-                if offline:
-                    raise RuntimeError('缺少压缩缓存；offline 模式不运行模型。')
-                if method in LOCAL_METHODS and engine is None:
-                    if sys.flags.hash_randomization:
-                        raise RuntimeError('请先在 CMD 中执行 set PYTHONHASHSEED=0')
-                    from compressors.runtime import verify_assets
-                    verify_assets([method])
-                    engine = create_compressor(method, config['device'])
-                if method == 'llm_summary' and client is None:
-                    client = make_client(config, 'summary', run, tokenizer, allow_api)
+            contexts = list(dict.fromkeys(e['context'] for e in read_json(folder/'examples.json')))
+            pending = [c for c in contexts if cached_compression(folder, c, method, ratio) is None]
+            if pending and offline:
+                raise RuntimeError('Missing compression cache; offline mode never runs a model.')
+            if pending and method in LOCAL_METHODS and engine is None:
+                if sys.flags.hash_randomization:
+                    raise RuntimeError('Set PYTHONHASHSEED=0 before starting Python.')
+                from compressors.runtime import verify_assets
+                verify_assets([method])
+                engine = create_compressor(method, config['device'])
+            if pending and method == 'llm_summary' and client is None:
+                client = api_client(config, 'summary', run, tokenizer, allow_api)
+
+            def task(context):
                 start = time.perf_counter()
                 result = compress_one(context, method, tokenizer, engine, client, ratio)
                 result['compression_seconds'] = time.perf_counter() - start
-                cached_compression(folder, context, method, ratio, result)
-                print(f'compress {name} {method} {i}/{len(contexts)}: {result["tokens"]}/{result["budget_tokens"]}', flush=True)
+                return result
+
+            workers = config.get('api_workers', 1) if method == 'llm_summary' else 1
+            completed = len(contexts) - len(pending)
+            interval = config['summary']['min_interval_seconds'] if method == 'llm_summary' else 0
+            with network_pacing(interval):
+                for context, result in bounded_results(task, pending, workers=workers):
+                    cached_compression(folder, context, method, ratio, result)
+                    completed += 1
+                    detail = f"tokens={result['tokens']}, target={result['budget_tokens']}"
+                    if progress:
+                        progress.update('compress/'+method, name, completed, len(contexts), detail)
+                    else:
+                        print(f'compress {name} {method} {completed}/{len(contexts)} {detail}', flush=True)
+            if progress:
+                progress.update('compress/'+method, name, completed, len(contexts), 'stage complete')
         del engine, client
         gc.collect()
         if 'torch' in sys.modules and config['device'] == 'cuda':
             sys.modules['torch'].cuda.empty_cache()
 
 
-def predict(config, run, tokenizer, allow_api=False):
-    """每题五条件，同一个 reader。每次请求有缓存，每完成一题保存一行。"""
-    client = make_client(config, 'reader', run, tokenizer, allow_api)
+def predict(config, run, tokenizer, allow_api=False, progress=None):
+    """Each API request is one question/condition. Only the main thread writes rows."""
+    client = api_client(config, 'reader', run, tokenizer, allow_api)
+    workers = config.get('api_workers', 1)
     for name in config['datasets']:
         folder = run/name
         examples = read_json(folder/'examples.json')
-        rows = []
-        for i, example in enumerate(examples, 1):
+
+        lengths = [tokenizer.count(e['context']) for e in examples]
+        def task(item):
+            index, method = item
+            example, original_tokens = examples[index], lengths[index]
             context = example['context']
-            original_tokens = tokenizer.count(context)
-            conditions = {}
-            for method in config['methods']:
-                if method in ('full', 'no_context'):
-                    text = context if method == 'full' else ''
-                    condition = {'text': text, 'tokens': tokenizer.count(text), 'budget_met': None,
-                                 'length_repair_used': False}
+            if method in ('full', 'no_context'):
+                text = context if method == 'full' else ''
+                condition = {'text': text, 'tokens': tokenizer.count(text), 'budget_met': None,
+                             'length_repair_used': False}
+            else:
+                condition = cached_compression(folder, context, method, config['retained_ratio'])
+                if condition is None:
+                    raise RuntimeError('Complete the compress stage first.')
+                condition = {**condition, 'local_compression_hash': fingerprint([context, method])}
+            forecast = predict_one(condition['text'], example['question'], client, config['reader']['max_tokens'])
+            return {**condition, **forecast, 'retained_ratio_actual': condition['tokens']/original_tokens}
+
+        conditions = {i: {} for i in range(len(examples))}
+        tasks = [(i, m) for i in range(len(examples)) for m in config['methods']]
+        with network_pacing(config['reader']['min_interval_seconds']):
+            for done, ((index, method), condition) in enumerate(bounded_results(task, tasks, workers=workers), 1):
+                conditions[index][method] = condition
+                complete = [i for i in range(len(examples)) if len(conditions[i]) == len(config['methods'])]
+                rows = [{**examples[i], 'original_tokens': lengths[i],
+                         'conditions': {m: conditions[i][m] for m in config['methods']}} for i in complete]
+                # Partial questions remain safe in API caches; only complete rows are saved.
+                if len(conditions[index]) == len(config['methods']):
+                    write_json(folder/'predictions.json', rows)
+                if progress:
+                    progress.update('predict_conditions', name, done, len(tasks), f'questions={len(complete)}/{len(examples)}')
                 else:
-                    condition = cached_compression(folder, context, method, config['retained_ratio'])
-                    if condition is None:
-                        raise RuntimeError('请先完成 compress 阶段。')
-                    condition = {**condition, 'local_compression_hash': fingerprint([context, method])}
-                forecast = predict_one(condition['text'], example['question'], client, config['reader']['max_tokens'])
-                conditions[method] = {**condition, **forecast,
-                                      'retained_ratio_actual': condition['tokens']/original_tokens}
-            rows.append({**example, 'original_tokens': original_tokens, 'conditions': conditions})
-            write_json(folder/'predictions.json', rows)
-            print(f'predict {name} {i}/{len(examples)}', flush=True)
+                    print(f'predict {name} {done}/{len(tasks)} conditions', flush=True)
 
 
 def evaluate(config, run):
@@ -142,10 +179,12 @@ def load_config(path):
     if not c['datasets'] or len(set(c['datasets']))!=len(c['datasets']) or set(c['datasets'])-{'hotpotqa','qasper'}:raise ValueError('Invalid datasets')
     if type(c['sample_size']) is not int or c['sample_size']<1 or c['bootstrap_repetitions']<2:raise ValueError('Invalid sample/bootstrap size')
     if c['device'] not in ('cuda','cpu') or c['cost_reserve_cny']<=0:raise ValueError('Invalid device/budget')
-    for role,model in [('reader','Qwen/Qwen3-30B-A3B-Instruct-2507'),('summary','deepseek-ai/DeepSeek-V3.2')]:
+    if type(c.get('api_workers', 1)) is not int or not 1 <= c.get('api_workers', 1) <= 4:raise ValueError('api_workers must be 1..4')
+    for role in ('reader', 'summary'):
+        models = {'Qwen/Qwen3-30B-A3B-Instruct-2507'} if role == 'reader' else {'deepseek-ai/DeepSeek-V3.2', 'Qwen/Qwen3-30B-A3B-Instruct-2507'}
         a=c[role]
-        if a['model']!=model or a['base_url']!='https://api.siliconflow.cn/v1' or a['temperature']!=0 or a['enable_thinking'] is not False:raise ValueError('Model/protocol change needs separate validation.')
-        if a['max_api_attempts']<1 or a['timeout_seconds']<=0 or a['min_interval_seconds']<0:raise ValueError('Invalid API limits')
+        if a['model'] not in models or a['base_url']!='https://api.siliconflow.cn/v1' or a['temperature']!=0 or a['enable_thinking'] is not False:raise ValueError('Model/protocol change needs separate validation.')
+        if a['max_api_attempts']<c.get('api_workers',1) or a['timeout_seconds']<=0 or a['min_interval_seconds']<0:raise ValueError('Invalid API limits')
     if c['reader']['stream'] or c['reader']['max_tokens']!=128:raise ValueError('Keep reader protocol unchanged.')
     return c
 
@@ -182,13 +221,26 @@ def main():
         parser.error('本精简协议固定五条件和 retained_ratio=0.5；请使用 config.json。')
     run = run_directory(config)
     with run_lock(run):
-        tokenizer = prepare(config, run, args.offline)
-        if args.stage in ('compress', 'all'):
-            compress(config, run, tokenizer, args.offline, args.allow_api)
-        if args.stage in ('predict', 'all'):
-            predict(config, run, tokenizer, args.allow_api)
-        if args.stage in ('evaluate', 'all'):
-            evaluate(config, run)
+        progress = Progress(run, args.stage)
+        try:
+            with progress.stage('prepare'):
+                tokenizer = prepare(config, run, args.offline)
+            if args.stage in ('compress', 'all'):
+                with progress.stage('compress'):
+                    compress(config, run, tokenizer, args.offline, args.allow_api, progress)
+            if args.stage in ('predict', 'all'):
+                with progress.stage('predict'):
+                    predict(config, run, tokenizer, args.allow_api, progress)
+            if args.stage in ('evaluate', 'all'):
+                with progress.stage('evaluate'):
+                    evaluate(config, run)
+        except BaseException:
+            progress.finish('failed_or_interrupted')
+            raise
+        else:
+            progress.finish('complete')
+            if args.stage in ('evaluate', 'all'):
+                build_report(config, run)  # Include final execution time, not a live estimate.
     print('Output:', run)
 
 if __name__=='__main__':

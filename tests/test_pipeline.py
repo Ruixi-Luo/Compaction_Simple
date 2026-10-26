@@ -47,7 +47,7 @@ class SimpleTests(unittest.TestCase):
 
     def test_full_pipeline_mocked_and_offline_replay(self):
         config = load_config(ROOT/'config.json')
-        config.update(datasets=['hotpotqa'], sample_size=2, bootstrap_repetitions=4, device='cpu')
+        config.update(datasets=['hotpotqa'], sample_size=2, bootstrap_repetitions=4, device='cpu', api_workers=1)
         examples = [{'id':str(i),'context':'one two three four five six', 'question':f'Question {i}?',
                      'label':i, 'context_group':'shared'} for i in range(2)]
         engine=Mock(); engine.compress.return_value='one two three four'  # over target is accepted

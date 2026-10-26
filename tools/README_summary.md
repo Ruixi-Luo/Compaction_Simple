@@ -1,3 +1,5 @@
+> 历史增量工具说明：2026-10-26起完整Qwen重跑请使用根目录 `run.py`。旧结果在项目旁边的 `backup_20261026/runs/`，不直接运行本工具恢复旧身份。
+
 # 只替换摘要模型，仍然是五个条件
 
 `replace_summary.py` 是原实验完成后的增量入口，复用本项目现有函数，不改变 `run.py` 的五条件主流程。它只把 DeepSeek summary 换为 Qwen summary；Full、No context、SC、LLMLingua-2 的 800 个预测逐字段复制。

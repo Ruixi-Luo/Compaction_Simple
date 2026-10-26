@@ -91,9 +91,11 @@ class CachedChatClient:
                 method="POST",
             )
             self.last_call = time.monotonic()
+            attempt_start = time.perf_counter()
             try:
                 with urlopen(request, timeout=self.config["timeout_seconds"]) as response:
                     body = read_stream(response) if payload["stream"] else json.load(response)
+                entry.update(elapsed_seconds=time.perf_counter()-attempt_start, finished_utc=datetime.now(timezone.utc).isoformat())
                 entry["status"] = "received"
                 entry["usage"] = body.get("usage", {})
                 write_json(cache_path, {
@@ -104,7 +106,7 @@ class CachedChatClient:
                 write_json(self.ledger_path, self.ledger)
                 return self._extract(body, request_hash)
             except HTTPError as error:
-                entry.update(status="http_error", http_status=error.code)
+                entry.update(status="http_error", http_status=error.code, elapsed_seconds=time.perf_counter()-attempt_start, finished_utc=datetime.now(timezone.utc).isoformat())
                 write_json(self.ledger_path, self.ledger)
                 if error.code not in {429, 500, 502, 503, 504} or attempt == 2:
                     # 不输出响应正文/请求头，避免服务端错误信息意外包含凭证。
@@ -113,7 +115,7 @@ class CachedChatClient:
                     # 免费端点的每分钟限额较低；不以密集重试加重限流。
                     retry_delay = 15 * (attempt + 1)
             except (URLError, TimeoutError, HTTPException, ConnectionError) as error:
-                entry.update(status="network_error", error_type=type(error).__name__)
+                entry.update(status="network_error", error_type=type(error).__name__, elapsed_seconds=time.perf_counter()-attempt_start, finished_utc=datetime.now(timezone.utc).isoformat())
                 write_json(self.ledger_path, self.ledger)
                 if attempt == 2:
                     raise RuntimeError("API connection failed after three attempts.") from None
